@@ -32,7 +32,10 @@ import com.google.common.util.concurrent.SmoothRateLimiter.SmoothBursty;
 import com.google.common.util.concurrent.SmoothRateLimiter.SmoothWarmingUp;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.time.Duration;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.Locale;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import org.jspecify.annotations.Nullable;
 
@@ -42,7 +45,11 @@ import org.jspecify.annotations.Nullable;
  * acquired, permits need not be released.
  *
  * <p>{@code RateLimiter} is safe for concurrent use: It will restrict the total rate of calls from
- * all threads. Note, however, that it does not guarantee fairness.
+ * all threads. Threads that have to wait for a permit are served in first-in, first-out order:
+ * once a thread has reserved its permits, no thread that reserves its permits later will return
+ * from {@link #acquire} or a successful {@link #tryAcquire} before it, regardless of scheduling
+ * jitter. (Permits that are available immediately are always granted on the spot, even while
+ * other threads are queued.)
  *
  * <p>Rate limiters are often used to restrict the rate at which some physical or logical resource
  * is accessed. This is in contrast to {@link java.util.concurrent.Semaphore} which restricts the
@@ -220,6 +227,16 @@ public abstract class RateLimiter {
   // Can't be initialized in the constructor because mocks don't call the constructor.
   private volatile @Nullable Object mutexDoNotUseDirectly;
 
+  /**
+   * The tickets whose holders are still waiting for their turn, in reservation (first-in,
+   * first-out) order. Permits that are available immediately never enter this queue: they are
+   * granted on the spot, even while other threads are queued.
+   *
+   * <p>Guarded by {@link #mutex()}. (This field is only ever dereferenced by methods that mocks
+   * do not invoke for real, so it does not need the lazy initialization that the mutex does.)
+   */
+  private final Deque<Ticket> waitQueue = new ArrayDeque<>();
+
   private Object mutex() {
     Object mutex = mutexDoNotUseDirectly;
     if (mutex == null) {
@@ -303,8 +320,27 @@ public abstract class RateLimiter {
    */
   @CanIgnoreReturnValue
   public double acquire(int permits) {
-    long microsToWait = reserve(permits);
-    stopwatch.sleepMicrosUninterruptibly(microsToWait);
+    checkPermits(permits);
+    long microsToWait;
+    Ticket ticket;
+    synchronized (mutex()) {
+      long nowMicros = stopwatch.readMicros();
+      microsToWait = reserveAndGetWaitLength(permits, nowMicros);
+      // Permits that are available right now are granted on the spot; only requests that have to
+      // wait for fresh permits take a ticket and join the queue.
+      ticket = (microsToWait == 0) ? null : enqueue(new Ticket(nowMicros + microsToWait));
+    }
+    if (ticket != null) {
+      awaitTurn(ticket);
+      long sleepMicros = remainingMicros(ticket);
+      try {
+        stopwatch.sleepMicrosUninterruptibly(sleepMicros);
+      } finally {
+        leaveQueue(ticket);
+      }
+    } else {
+      stopwatch.sleepMicrosUninterruptibly(0);
+    }
     return 1.0 * microsToWait / SECONDS.toMicros(1L);
   }
 
@@ -412,15 +448,122 @@ public abstract class RateLimiter {
     long timeoutMicros = max(unit.toMicros(timeout), 0);
     checkPermits(permits);
     long microsToWait;
+    Ticket ticket;
     synchronized (mutex()) {
       long nowMicros = stopwatch.readMicros();
       if (!canAcquire(nowMicros, timeoutMicros)) {
         return false;
       }
       microsToWait = reserveAndGetWaitLength(permits, nowMicros);
+      // Permits that are available right now are granted on the spot, even if other threads are
+      // already queued; only requests that have to wait for fresh permits join the queue.
+      ticket = (microsToWait == 0) ? null : enqueue(new Ticket(nowMicros + microsToWait));
     }
-    stopwatch.sleepMicrosUninterruptibly(microsToWait);
+    if (ticket == null) {
+      stopwatch.sleepMicrosUninterruptibly(0);
+      return true;
+    }
+    if (!awaitTurn(ticket, timeoutMicros)) {
+      return false;
+    }
+    long sleepMicros = remainingMicros(ticket);
+    try {
+      stopwatch.sleepMicrosUninterruptibly(sleepMicros);
+    } finally {
+      leaveQueue(ticket);
+    }
     return true;
+  }
+
+  /**
+   * A reservation for permits that could not be granted immediately. Tickets are served in
+   * first-in, first-out order: a ticket's turn starts only after every ticket reserved before it
+   * has completed, so scheduling jitter cannot reorder threads that are waiting for permits.
+   */
+  private static final class Ticket {
+    /** The time, on the stopwatch's clock, at which the reserved permits may be used. */
+    final long deadlineMicros;
+
+    /** Counted down once every ticket reserved before this one has completed. */
+    final CountDownLatch turn = new CountDownLatch(1);
+
+    Ticket(long deadlineMicros) {
+      this.deadlineMicros = deadlineMicros;
+    }
+  }
+
+  /**
+   * Adds {@code ticket} at the tail of the queue and returns it, signaling it immediately if the
+   * queue was empty. Must be called while holding the mutex, atomically with the reservation.
+   */
+  private Ticket enqueue(Ticket ticket) {
+    if (waitQueue.isEmpty()) {
+      ticket.turn.countDown();
+    }
+    waitQueue.addLast(ticket);
+    return ticket;
+  }
+
+  /**
+   * Waits until it is {@code ticket}'s turn, that is, until every ticket reserved before it has
+   * completed.
+   *
+   * <p>If the thread is interrupted while waiting, the ticket is removed from the queue, so that
+   * later tickets are not stuck waiting for a signal that would never come, and the interrupt
+   * status is restored. The reservation itself is kept, so the caller still sleeps until the
+   * ticket's deadline before returning.
+   */
+  private void awaitTurn(Ticket ticket) {
+    try {
+      ticket.turn.await();
+    } catch (InterruptedException e) {
+      leaveQueue(ticket);
+      Thread.currentThread().interrupt();
+    }
+  }
+
+  /**
+   * Waits until it is {@code ticket}'s turn, or until the timeout expires.
+   *
+   * @return {@code false} if the timeout expired before the ticket's turn arrived, in which case
+   *     the ticket has been removed from the queue so that later tickets are not stuck behind it
+   */
+  private boolean awaitTurn(Ticket ticket, long timeoutMicros) {
+    boolean turnArrived;
+    try {
+      turnArrived = ticket.turn.await(timeoutMicros, MICROSECONDS);
+    } catch (InterruptedException e) {
+      // As in the untimed case: leave the queue cleanly, restore the status, and proceed, since
+      // the reservation has already been paid for.
+      leaveQueue(ticket);
+      Thread.currentThread().interrupt();
+      return true;
+    }
+    if (!turnArrived) {
+      leaveQueue(ticket);
+    }
+    return turnArrived;
+  }
+
+  /**
+   * Removes {@code ticket} from the queue (a no-op if it has already been removed), signaling the
+   * new head of the queue if there is one.
+   */
+  private void leaveQueue(Ticket ticket) {
+    synchronized (mutex()) {
+      waitQueue.remove(ticket);
+      Ticket next = waitQueue.peek();
+      if (next != null) {
+        next.turn.countDown();
+      }
+    }
+  }
+
+  /** Returns the microseconds left until the ticket's permits may be used, never negative. */
+  private long remainingMicros(Ticket ticket) {
+    synchronized (mutex()) {
+      return max(ticket.deadlineMicros - stopwatch.readMicros(), 0);
+    }
   }
 
   private boolean canAcquire(long nowMicros, long timeoutMicros) {
